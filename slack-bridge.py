@@ -8,7 +8,7 @@ are posted back to the same Slack thread.
 
 Architecture:
   Slack #inv-capital  ──►  Bridge (Socket Mode)  ──►  Anthropic Sessions API
-       ◄─────────────────────────────────────────────────┘
+       ◄──────────────────────────────────────────────────┘
 
 Requirements:
   pip install slack_bolt anthropic python-dotenv
@@ -39,7 +39,7 @@ try:
 except ImportError:
     pass
 
-# Configuration
+# ─── Configuration ────────────────────────────────────────────────────────────
 
 def require_env(key: str) -> str:
     val = os.environ.get(key)
@@ -60,12 +60,13 @@ SLACK_APP_TOKEN = require_env("SLACK_APP_TOKEN")
 BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID", "U0AT2RJSDBR")
 
 # Bridge settings
-MAX_POLL_ATTEMPTS = 60
-POLL_INTERVAL_SECS = 3
-SESSION_TTL_SECS = 3600
-MAX_RESPONSE_LENGTH = 3900
+MAX_POLL_ATTEMPTS = 100      # Max ~5 minutes polling
+POLL_INTERVAL_SECS = 3       # Seconds between status checks
+SESSION_TTL_SECS = 3600      # Reuse session for 1 hour
+MAX_RESPONSE_LENGTH = 3900   # Slack message limit (with margin)
 
-# Logging
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -73,21 +74,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("inv09-bridge")
 
-# Anthropic Client
+# ─── Anthropic Client ─────────────────────────────────────────────────────────
+
 ant = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Session Management
-_sessions = {}
+# ─── Session Management ──────────────────────────────────────────────────────
+# One active session per Slack thread. Falls back to a default session for
+# top-level messages (no thread).
+
+_sessions = {}          # thread_ts -> {"session_id": ..., "created_at": ...}
 _session_lock = threading.Lock()
 
 
 def get_or_create_session(thread_key: str) -> str:
+    """Return an active session ID for the given thread, creating one if needed."""
     with _session_lock:
         entry = _sessions.get(thread_key)
         now = time.time()
+
+        # Reuse existing session if still fresh
         if entry and (now - entry["created_at"]) < SESSION_TTL_SECS:
             log.info(f"Reusing session {entry['session_id']} for thread {thread_key}")
             return entry["session_id"]
+
+        # Create a new session
         log.info(f"Creating new INV-09 session for thread {thread_key}...")
         session = ant.beta.sessions.create(
             agent=AGENT_ID,
@@ -101,34 +111,30 @@ def get_or_create_session(thread_key: str) -> str:
                 }
             ],
         )
-        _sessions[thread_key] = {"session_id": session.id, "created_at": now}
+        _sessions[thread_key] = {
+            "session_id": session.id,
+            "created_at": now,
+        }
         log.info(f"Session created: {session.id}")
         return session.id
 
 
-def send_and_wait(session_id: str, message: str) -> str:
-    log.info(f"Sending message to session {session_id}: {message[:80]}...")
-    ant.beta.sessions.events.send(
-        session_id=session_id,
-        events=[
-            {"type": "user.message", "content": [{"type": "text", "text": message}]}
-        ],
-    )
-    for attempt in range(MAX_POLL_ATTEMPTS):
-        time.sleep(POLL_INTERVAL_SECS)
-        sess = ant.beta.sessions.retrieve(session_id=session_id)
-        status = sess.status
-        log.info(f"  Poll {attempt+1}/{MAX_POLL_ATTEMPTS}: status={status}")
-        if status in ("ready", "completed", "ended"):
-            break
-        if status in ("failed", "error"):
-            return f"[Error: session ended with status '{status}']"
-    else:
-        return "[Error: agent timed out after 3 minutes]"
-    events = list(ant.beta.sessions.events.list(session_id=session_id, limit=100))
+def _count_events(session_id: str) -> int:
+    """Count current events in a session."""
+    try:
+        events = list(ant.beta.sessions.events.list(session_id=session_id, limit=200))
+        return len(events)
+    except Exception as e:
+        log.warning(f"Failed to count events: {e}")
+        return 0
+
+
+def _extract_last_agent_text(events: list) -> str:
+    """Extract the last agent/assistant message text from events."""
     assistant_text = ""
     for ev in events:
         ev_type = getattr(ev, "type", None)
+        # Managed agents emit "agent.message"; direct sessions emit "assistant.message"
         if ev_type in ("agent.message", "assistant.message"):
             content = getattr(ev, "content", None)
             if isinstance(content, str):
@@ -136,24 +142,117 @@ def send_and_wait(session_id: str, message: str) -> str:
             elif isinstance(content, list):
                 for block in content:
                     if getattr(block, "type", None) == "text":
-                        assistant_text = block.text
-    if not assistant_text:
-        return "[Agent processed the request but returned no text response]"
+                        assistant_text = block.text  # Take the last one
     return assistant_text
 
 
-# Slack App
+def send_and_wait(session_id: str, message: str) -> str:
+    """Send a user message to the agent session and poll until done.
+
+    Strategy: count events before sending, then poll for NEW events.
+    The managed agent may return to 'idle' after processing, so we
+    detect completion by checking for new agent.message events rather
+    than relying solely on session status.
+    """
+    log.info(f"Sending message to session {session_id}: {message[:80]}...")
+
+    # Count events BEFORE sending so we can detect new ones
+    events_before = _count_events(session_id)
+    log.info(f"Events before send: {events_before}")
+
+    # Send the user message
+    ant.beta.sessions.events.send(
+        session_id=session_id,
+        events=[
+            {
+                "type": "user.message",
+                "content": [{"type": "text", "text": message}],
+            }
+        ],
+    )
+
+    # Poll until we detect the agent has responded
+    found_response = False
+    last_status = ""
+
+    for attempt in range(MAX_POLL_ATTEMPTS):
+        time.sleep(POLL_INTERVAL_SECS)
+
+        # Check session status
+        try:
+            sess = ant.beta.sessions.retrieve(session_id=session_id)
+            last_status = sess.status
+        except Exception as e:
+            log.warning(f"Failed to retrieve session status: {e}")
+            last_status = "unknown"
+
+        log.info(f"  Poll {attempt+1}/{MAX_POLL_ATTEMPTS}: status={last_status}")
+
+        # Hard failure statuses
+        if last_status in ("failed", "error"):
+            return f"[Error: session ended with status '{last_status}']"
+
+        # If still processing, keep waiting
+        if last_status == "processing":
+            continue
+
+        # For idle/ready/completed/ended: check if new events appeared
+        if last_status in ("idle", "ready", "completed", "ended"):
+            try:
+                events_now = list(ant.beta.sessions.events.list(
+                    session_id=session_id, limit=200
+                ))
+                events_count = len(events_now)
+
+                if events_count > events_before:
+                    # New events appeared — check for agent response
+                    agent_text = _extract_last_agent_text(events_now)
+                    if agent_text:
+                        log.info(f"Agent responded! ({events_count - events_before} new events)")
+                        return agent_text
+                    else:
+                        log.info(f"New events ({events_count}) but no agent text yet, continuing...")
+                else:
+                    # No new events yet — agent might not have started
+                    if attempt < 5:
+                        log.info(f"No new events yet (still {events_count}), waiting for agent to start...")
+                    elif attempt % 10 == 0:
+                        log.info(f"Still waiting... events={events_count}, status={last_status}")
+            except Exception as e:
+                log.warning(f"Failed to list events: {e}")
+
+    # Timeout — do one final check for events
+    log.warning("Polling timed out, doing final event check...")
+    try:
+        events_final = list(ant.beta.sessions.events.list(
+            session_id=session_id, limit=200
+        ))
+        agent_text = _extract_last_agent_text(events_final)
+        if agent_text:
+            log.info("Found agent response in final check!")
+            return agent_text
+    except Exception:
+        pass
+
+    return f"[Error: agent timed out after {MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECS // 60} minutes (last status: {last_status})]"
+
+
+# ─── Slack App ────────────────────────────────────────────────────────────────
+
 app = App(token=SLACK_BOT_TOKEN)
 
 
 def split_message(text: str, max_len: int = MAX_RESPONSE_LENGTH) -> list[str]:
+    """Split a long message into chunks that fit within Slack's limit."""
     if len(text) <= max_len:
         return [text]
+
     chunks = []
     while text:
         if len(text) <= max_len:
             chunks.append(text)
             break
+        # Try to split at a newline
         split_at = text.rfind("\n", 0, max_len)
         if split_at == -1:
             split_at = max_len
@@ -163,51 +262,86 @@ def split_message(text: str, max_len: int = MAX_RESPONSE_LENGTH) -> list[str]:
 
 
 def format_response(text: str) -> str:
+    """Light formatting for Slack: strip excessive markdown."""
+    # Convert markdown headers to bold
     text = re.sub(r"^#{1,3}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
     return text
 
 
 @app.event("message")
 def handle_message(event, say, client):
-    pass
+    """Acknowledge regular messages but do NOT forward to agent.
+
+    Only @COS Agent mentions trigger the agent. This prevents:
+    - Team conversations from being sent as prompts
+    - Messages tagging other people (e.g. "@gramirez Mira esto")
+      from being misinterpreted as agent instructions
+    - Wasted API tokens on non-agent traffic
+    """
+    pass  # Required handler to avoid Slack "unhandled event" warnings
 
 
 def _process_agent_request(event, say, client):
+    """Core logic: forward a message to INV-09 CAPITAL and post the response."""
     user = event.get("user", "")
     bot_id = event.get("bot_id", "")
     subtype = event.get("subtype", "")
+
+    # Ignore bot's own messages
     if bot_id or user == BOT_USER_ID or subtype in ("bot_message", "message_changed"):
         return
+
     text = event.get("text", "").strip()
     if not text:
         return
+
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
     ts = event.get("ts")
+
     log.info(f"Agent request from {user} in {channel}: {text[:80]}...")
+
+    # Post a "thinking" reaction
     try:
         client.reactions_add(channel=channel, name="hourglass_flowing_sand", timestamp=ts)
     except Exception:
         pass
 
+    # Process in a thread to not block the event loop
     def process():
         try:
+            # Get or create a session for this thread
             session_id = get_or_create_session(thread_ts)
+
+            # Send message and wait for response
             response = send_and_wait(session_id, text)
             response = format_response(response)
+
+            # Post response back to the same thread
             chunks = split_message(response)
             for i, chunk in enumerate(chunks):
-                say(text=chunk, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+                say(
+                    text=chunk,
+                    thread_ts=thread_ts,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
                 if i < len(chunks) - 1:
-                    time.sleep(0.5)
+                    time.sleep(0.5)  # Rate limit
+
+            # Remove "thinking" reaction, add "check"
             try:
                 client.reactions_remove(channel=channel, name="hourglass_flowing_sand", timestamp=ts)
                 client.reactions_add(channel=channel, name="white_check_mark", timestamp=ts)
             except Exception:
                 pass
+
         except Exception as e:
             log.error(f"Error processing message: {e}", exc_info=True)
-            say(text=f"[Bridge error: {str(e)[:200]}]", thread_ts=thread_ts)
+            say(
+                text=f"[Bridge error: {str(e)[:200]}]",
+                thread_ts=thread_ts,
+            )
             try:
                 client.reactions_remove(channel=channel, name="hourglass_flowing_sand", timestamp=ts)
                 client.reactions_add(channel=channel, name="x", timestamp=ts)
@@ -219,20 +353,32 @@ def _process_agent_request(event, say, client):
 
 @app.event("app_mention")
 def handle_mention(event, say, client):
+    """Only @COS Agent mentions trigger the agent.
+
+    Examples:
+      "@COS Agent dame el Investor Fit Score de Sequoia" → TRIGGERS agent
+      "@gramirez Mira esto, no estoy de acuerdo"         → Ignored (regular message)
+      "Equipo, revisemos los números"                    → Ignored (regular message)
+    """
+    # Strip the bot mention prefix, keep the rest as the prompt
     text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
     if text:
         event["text"] = text
         _process_agent_request(event, say, client)
 
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("INV-09 CAPITAL — Slack Bridge")
+    log.info("INV-09 CAPITAL — Slack Bridge v2.0")
     log.info(f"Agent:       {AGENT_ID}")
     log.info(f"Environment: {ENVIRONMENT_ID}")
     log.info(f"Vault:       {VAULT_ID}")
     log.info(f"Bot User:    {BOT_USER_ID}")
+    log.info(f"Polling:     {MAX_POLL_ATTEMPTS} attempts x {POLL_INTERVAL_SECS}s = {MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECS // 60}min max")
     log.info("=" * 60)
     log.info("Starting Socket Mode connection...")
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
